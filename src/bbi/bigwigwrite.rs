@@ -9,7 +9,7 @@ use futures::task::SpawnExt;
 
 use byteorder::{NativeEndian, WriteBytesExt};
 
-use crate::utils::chromvalues::ChromValues;
+use crate::utils::chromvalues::{ChromValues, LockedChromvalues};
 use crate::utils::tell::Tell;
 use crate::ChromData;
 
@@ -179,7 +179,8 @@ impl BigWigWrite {
                 })
                 .collect(),
         };
-        while let Some(current_val) = chrom_values.next() {
+        let locked_values = chrom_values.lock();
+        while let Some(current_val) = locked_values.next() {
             // If there is a source error, propogate that up
             let current_val = current_val.map_err(ProcessChromError::SourceError)?;
 
@@ -200,7 +201,7 @@ impl BigWigWrite {
                     current_val.end, chrom, chrom_length
                 )));
             }
-            match chrom_values.peek() {
+            match locked_values.peek() {
                 None | Some(Err(_)) => (),
                 Some(Ok(next_val)) => {
                     if current_val.end > next_val.start {
@@ -244,7 +245,7 @@ impl BigWigWrite {
                     // Write section if full; or if no next section, some items, and no current zoom record
                     if (add_start >= current_val.end
                         && zoom_item.live_info.is_none()
-                        && chrom_values.peek().is_none()
+                        && locked_values.peek().is_none()
                         && !zoom_item.records.is_empty())
                         || zoom_item.records.len() == options.items_per_slot as usize
                     {
@@ -258,7 +259,7 @@ impl BigWigWrite {
                             .expect("Couln't send");
                     }
                     if add_start >= current_val.end {
-                        if chrom_values.peek().is_none() {
+                        if locked_values.peek().is_none() {
                             if let Some(zoom2) = zoom_item.live_info.take() {
                                 zoom_item.records.push(zoom2);
                                 continue;
@@ -306,7 +307,7 @@ impl BigWigWrite {
             }
             // Then, add the current item to the actual values, and encode if full, or last item
             state_val.items.push(current_val);
-            if chrom_values.peek().is_none()
+            if locked_values.peek().is_none()
                 || state_val.items.len() >= options.items_per_slot as usize
             {
                 let items = std::mem::take(&mut state_val.items);

@@ -83,8 +83,17 @@ pub fn parse_bedgraph<'a>(s: &'a str) -> Option<Result<(&'a str, Value), BedValu
 /// values of bed-like data
 pub trait StreamingBedValues {
     type Value;
+    type Unlocked: UnlockedStreamingBedValues<Locked = Self>;
 
+    fn unlock(self) -> Self::Unlocked;
     fn next(&mut self) -> Option<Result<(&str, Self::Value), BedValueError>>;
+}
+
+pub trait UnlockedStreamingBedValues {
+    type Value;
+    type Locked: StreamingBedValues<Unlocked = Self, Value = Self::Value> ;
+
+    fn lock(self) -> Self::Locked;
 }
 
 #[derive(Error, Debug)]
@@ -105,6 +114,11 @@ pub struct BedFileStream<V, B> {
 
 impl<V, B: BufRead> StreamingBedValues for BedFileStream<V, B> {
     type Value = V;
+    type Unlocked = Self;
+
+    fn unlock(self) -> Self::Unlocked {
+        self
+    }
 
     fn next(&mut self) -> Option<Result<(&str, Self::Value), BedValueError>> {
         let line = match self.bed.read()? {
@@ -119,6 +133,15 @@ impl<V, B: BufRead> StreamingBedValues for BedFileStream<V, B> {
     }
 }
 
+impl<V, B: BufRead> UnlockedStreamingBedValues for BedFileStream<V, B> {
+    type Value = V;
+    type Locked = Self;
+
+    fn lock(self) -> Self::Locked {
+        self
+    }
+}
+
 // Wraps a bed-like Iterator
 pub struct BedIteratorStream<V, I> {
     iter: I,
@@ -129,6 +152,11 @@ impl<V: Clone, E: Into<BedValueError>, I: Iterator<Item = Result<(String, V), E>
     StreamingBedValues for BedIteratorStream<V, I>
 {
     type Value = V;
+    type Unlocked = Self;
+
+    fn unlock(self) -> Self::Unlocked {
+        self
+    }
 
     fn next(&mut self) -> Option<Result<(&str, V), BedValueError>> {
         use std::ops::Deref;
@@ -140,8 +168,63 @@ impl<V: Clone, E: Into<BedValueError>, I: Iterator<Item = Result<(String, V), E>
     }
 }
 
+impl<V: Clone, E: Into<BedValueError>, I: Iterator<Item = Result<(String, V), E>>>
+    UnlockedStreamingBedValues for BedIteratorStream<V, I>
+{
+    type Value = V;
+    type Locked = Self;
+
+    fn lock(self) -> Self::Locked {
+        self
+    }
+}
+
+pub struct BedStdInStream<V> {
+    pub parse: Parser<V>,
+}
+
+pub struct LockedBedStdInStream<V> {
+    pub bed: StreamingLineReader<std::io::StdinLock<'static>>,
+    pub parse: Parser<V>,
+}
+
+impl<V> StreamingBedValues for LockedBedStdInStream<V> {
+    type Value = V;
+    type Unlocked = BedStdInStream<V>;
+
+    fn unlock(self) -> Self::Unlocked {
+        BedStdInStream {
+            parse: self.parse,
+        }
+    }
+
+    fn next(&mut self) -> Option<Result<(&str, Self::Value), BedValueError>> {
+        let line = match self.bed.read()? {
+            Ok(line) => line.trim_end(),
+            Err(e) => return Some(Err(e.into())),
+        };
+        match (self.parse)(line) {
+            None => None,
+            Some(Ok(v)) => Some(Ok(v)),
+            Some(Err(e)) => Some(Err(e.into())),
+        }
+    }
+}
+
+impl<V> UnlockedStreamingBedValues for BedStdInStream<V> {
+    type Value = V;
+    type Locked = LockedBedStdInStream<V>;
+
+    fn lock(self) -> Self::Locked {
+        LockedBedStdInStream {
+            bed: StreamingLineReader::new(std::io::stdin().lock()),
+            parse: self.parse,
+        }
+    }
+}
+
 /// A wrapper for "bed-like" data
-pub struct BedParser<S: StreamingBedValues> {
+pub struct BedParser<S: UnlockedStreamingBedValues> {
     state: Arc<AtomicCell<Option<BedParserState<S>>>>,
 }
 
@@ -200,12 +283,17 @@ impl<V> StateValue<V> {
 }
 
 #[derive(Debug)]
-pub(crate) struct BedParserState<S: StreamingBedValues> {
+pub(crate) struct BedParserState<S: UnlockedStreamingBedValues> {
     stream: S,
     pub(crate) state_value: StateValue<S::Value>,
 }
 
-impl<S: StreamingBedValues> BedParser<S> {
+pub(crate) struct LockedBedParserState<S: StreamingBedValues> {
+    stream: S,
+    pub(crate) state_value: StateValue<S::Value>,
+}
+
+impl<S: UnlockedStreamingBedValues> BedParser<S> {
     pub fn new(stream: S) -> Self {
         let state = BedParserState {
             stream,
@@ -235,6 +323,14 @@ impl<R: Read> BedParser<BedFileStream<Value, BufReader<R>>> {
     }
 }
 
+impl BedParser<BedStdInStream<Value>> {
+    pub fn from_bedgraph_stdin() -> Self {
+        BedParser::new(BedStdInStream {
+            parse: parse_bedgraph,
+        })
+    }
+}
+
 impl<V: Clone, E: Into<BedValueError>, I: Iterator<Item = Result<(String, V), E>>>
     BedParser<BedIteratorStream<V, I>>
 {
@@ -243,15 +339,17 @@ impl<V: Clone, E: Into<BedValueError>, I: Iterator<Item = Result<(String, V), E>
     }
 }
 
-impl<S: StreamingBedValues> BedParser<S> {
+impl<S: UnlockedStreamingBedValues> BedParser<S> {
     // This is *valid* to call multiple times for the same chromosome (assuming the
     // `BedChromData` has been dropped), since calling this function doesn't
     // actually advance the state (it will only set `next_val` if it currently is none).
     pub fn next_chrom(&mut self) -> Option<Result<(String, BedChromData<S>), BedValueError>> {
-        let mut state = self.state.swap(None).expect("Invalid usage. This iterator does not buffer and all values should be exhausted for a chrom before next() is called.");
+        let state = self.state.swap(None).expect("Invalid usage. This iterator does not buffer and all values should be exhausted for a chrom before next() is called.");
+        let mut state = LockedBedParserState { stream: state.stream.lock(), state_value: state.state_value };
         state.load_state(true);
         let error = state.state_value.take_error();
         let chrom = state.state_value.active_chrom().cloned();
+        let state = BedParserState { stream: state.stream.unlock(), state_value: state.state_value };
         self.state.swap(Some(state));
 
         if let Some(e) = error {
@@ -272,7 +370,7 @@ impl<S: StreamingBedValues> BedParser<S> {
     }
 }
 
-impl<S: StreamingBedValues> BedParserState<S> {
+impl<S: StreamingBedValues> LockedBedParserState<S> {
     pub(crate) fn load_state(&mut self, switch_chrom: bool) {
         let state_value = std::mem::replace(&mut self.state_value, StateValue::Empty);
         self.state_value = match state_value {
@@ -341,14 +439,14 @@ impl<S: StreamingBedValues> BedParserState<S> {
 // to the next until we've exhausted the current. In this *particular*
 // implementation, we don't allow parallel iteration of chromsomes. So, the
 // state is either needed *here* or in the main struct.
-pub struct BedChromData<S: StreamingBedValues> {
+pub struct BedChromData<S: UnlockedStreamingBedValues> {
     state: Arc<AtomicCell<Option<BedParserState<S>>>>,
-    curr_state: Option<BedParserState<S>>,
+    curr_state: Option<LockedBedParserState<S::Locked>>,
     pub(crate) done: bool,
 }
 
-impl<S: StreamingBedValues> BedChromData<S> {
-    pub(crate) fn load_state(&mut self) -> Option<&mut BedParserState<S>> {
+impl<S: UnlockedStreamingBedValues> BedChromData<S> {
+    pub(crate) fn load_state(&mut self) -> Option<&mut LockedBedParserState<S::Locked>> {
         if self.done {
             return None;
         }
@@ -357,16 +455,16 @@ impl<S: StreamingBedValues> BedChromData<S> {
             if opt_state.is_none() {
                 panic!("Invalid usage. This iterator does not buffer and all values should be exhausted for a chrom before next() is called.");
             }
-            self.curr_state = opt_state;
+            self.curr_state = opt_state.map(|s| LockedBedParserState { stream: s.stream.lock(), state_value: s.state_value });
         }
         Some(self.curr_state.as_mut().unwrap())
     }
 }
 
-impl<S: StreamingBedValues> Drop for BedChromData<S> {
+impl<S: UnlockedStreamingBedValues> Drop for BedChromData<S> {
     fn drop(&mut self) {
         if let Some(state) = self.curr_state.take() {
-            self.state.swap(Some(state));
+            self.state.swap(Some(BedParserState { stream: state.stream.unlock(), state_value: state.state_value }));
         }
     }
 }

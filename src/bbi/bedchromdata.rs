@@ -13,19 +13,19 @@ use std::io::{self, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use crate::bed::bedparser::{
-    BedChromData, BedFileStream, BedParser, BedValueError, Parser, StateValue, StreamingBedValues,
+    BedChromData, BedFileStream, BedParser, BedValueError, Parser, StateValue, StreamingBedValues, UnlockedStreamingBedValues,
 };
 use crate::utils::chromvalues::ChromValues;
 use crate::utils::streaming_linereader::StreamingLineReader;
 use crate::{ChromData, ChromDataState, ChromProcessingFnOutput};
 
-pub struct BedParserStreamingIterator<S: StreamingBedValues> {
+pub struct BedParserStreamingIterator<S: UnlockedStreamingBedValues> {
     bed_data: BedParser<S>,
     allow_out_of_order_chroms: bool,
     last_chrom: Option<String>,
 }
 
-impl<S: StreamingBedValues> BedParserStreamingIterator<S> {
+impl<S: UnlockedStreamingBedValues> BedParserStreamingIterator<S> {
     pub fn new(bed_data: BedParser<S>, allow_out_of_order_chroms: bool) -> Self {
         BedParserStreamingIterator {
             bed_data,
@@ -35,7 +35,7 @@ impl<S: StreamingBedValues> BedParserStreamingIterator<S> {
     }
 }
 
-impl<S: StreamingBedValues, E: From<io::Error>> ChromData<E> for BedParserStreamingIterator<S> {
+impl<S: UnlockedStreamingBedValues, E: From<io::Error>> ChromData<E> for BedParserStreamingIterator<S> {
     type Output = BedChromData<S>;
 
     /// Advancing after `ChromDataState::Finished` has been called will result in a panic.
@@ -169,7 +169,8 @@ impl<V, E: From<io::Error>> ChromData<E>
     }
 }
 
-impl<S: StreamingBedValues> ChromValues for BedChromData<S> {
+
+impl<S: UnlockedStreamingBedValues> ChromValues for BedChromData<S> {
     type Value = S::Value;
     type Error = BedValueError;
 
